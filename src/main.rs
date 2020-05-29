@@ -1,47 +1,47 @@
+extern crate core_foundation;
+extern crate euclid;
 extern crate gleam;
 extern crate glutin;
 extern crate libc;
-extern crate euclid;
-extern crate core_foundation;
 
 use euclid::{Transform3D, Vector3D};
 
-use gleam::gl::Gl;
 use gleam::gl;
+use gleam::gl::ErrorCheckingGl;
+use gleam::gl::GLuint;
+use gleam::gl::Gl;
 
 use glutin::event::{Event, WindowEvent};
 use glutin::event_loop::ControlFlow;
 
+use std::ptr;
 use std::rc::Rc;
-
-use gleam::gl::GLuint;
-use gleam::gl::ErrorCheckingGl;
-
+use std::time::Instant;
 
 /* It was already known that the efficiency gains from client storage only materialize if you
-   follow certain restrictions:
-   - The textures need to use the TEXTURE_RECTANGLE_ARB texture target.
-   - The textures' format, internalFormat and type need to be chosen from a small list of
-     supported configurations. Unsupported configurations will trigger format conversions on the CPU.
-   - The GL_TEXTURE_STORAGE_HINT_APPLE may need to be set to shared or cached. -
-     glTextureRangeAPPLE may or may not make a difference.
+  follow certain restrictions:
+  - The textures need to use the TEXTURE_RECTANGLE_ARB texture target.
+  - The textures' format, internalFormat and type need to be chosen from a small list of
+    supported configurations. Unsupported configurations will trigger format conversions on the CPU.
+  - The GL_TEXTURE_STORAGE_HINT_APPLE may need to be set to shared or cached. -
+    glTextureRangeAPPLE may or may not make a difference.
 
- It now appears that the stride alignment is another requirement: When uploading textures which
- otherwise comply with the above requirements, the Intel driver will still make copies using the
- CPU if the texture's stride is not 32-byte aligned. These CPU copies are reflected in a high CPU
- usage (as observed in Activity Monitor) and they show up in profiles as time spent inside
- _platform_memmove under glrUpdateTexture.
+It now appears that the stride alignment is another requirement: When uploading textures which
+otherwise comply with the above requirements, the Intel driver will still make copies using the
+CPU if the texture's stride is not 32-byte aligned. These CPU copies are reflected in a high CPU
+usage (as observed in Activity Monitor) and they show up in profiles as time spent inside
+_platform_memmove under glrUpdateTexture.
 
- */
+*/
 
 struct Options {
     pbo: bool,
+    pbo_reallocate_buffer: bool,
     client_storage: bool,
     texture_array: bool,
     texture_storage: bool,
     swizzle: bool,
 }
-
 
 fn init_shader_program(gl: &Rc<dyn Gl>, vs_source: &[u8], fs_source: &[u8]) -> gl::GLuint {
     let vertex_shader = load_shader(gl, gl::VERTEX_SHADER, vs_source);
@@ -54,10 +54,9 @@ fn init_shader_program(gl: &Rc<dyn Gl>, vs_source: &[u8], fs_source: &[u8]) -> g
     let mut link_status = [0];
     unsafe {
         gl.get_program_iv(shader_program, gl::LINK_STATUS, &mut link_status);
-            if link_status[0] == 0 {
-                println!("LINK: {}", gl.get_program_info_log(shader_program));
-            }
-
+        if link_status[0] == 0 {
+            println!("LINK: {}", gl.get_program_info_log(shader_program));
+        }
     }
     shader_program
 }
@@ -65,14 +64,20 @@ fn init_shader_program(gl: &Rc<dyn Gl>, vs_source: &[u8], fs_source: &[u8]) -> g
 struct Buffers {
     position: GLuint,
     texture_coord: GLuint,
-    indices: GLuint
+    indices: GLuint,
 }
 
-fn init_buffers(gl: &Rc<dyn gl::Gl>, texture_rectangle: bool, texture_width: i32, texture_height: i32) -> Buffers {
+fn init_buffers(
+    gl: &Rc<dyn gl::Gl>,
+    texture_rectangle: bool,
+    texture_width: i32,
+    texture_height: i32,
+) -> Buffers {
     let position_buffer = gl.gen_buffers(1)[0];
 
     gl.bind_buffer(gl::ARRAY_BUFFER, position_buffer);
 
+    #[rustfmt::skip]
     let positions = [
         // Front face
         -1.0f32, -1.0,  1.0,
@@ -111,17 +116,29 @@ fn init_buffers(gl: &Rc<dyn gl::Gl>, texture_rectangle: bool, texture_width: i32
         -1.0,  1.0, -1.0,
     ];
 
-
-    gl.buffer_data_untyped(gl::ARRAY_BUFFER, std::mem::size_of_val(&positions) as isize, positions.as_ptr() as *const libc::c_void, gl::STATIC_DRAW);
-
+    gl.buffer_data_untyped(
+        gl::ARRAY_BUFFER,
+        std::mem::size_of_val(&positions) as isize,
+        positions.as_ptr() as *const libc::c_void,
+        gl::STATIC_DRAW,
+    );
 
     let texture_coord_buffer = gl.gen_buffers(1)[0];
 
     gl.bind_buffer(gl::ARRAY_BUFFER, texture_coord_buffer);
 
-    let width = if texture_rectangle { texture_width as f32 } else { 1.0 };
-    let height = if texture_rectangle { texture_height as f32 } else { 1.0 };
+    let width = if texture_rectangle {
+        texture_width as f32
+    } else {
+        1.0
+    };
+    let height = if texture_rectangle {
+        texture_height as f32
+    } else {
+        1.0
+    };
 
+    #[rustfmt::skip]
     let texture_coordinates = [
         // Front
         0.0f32,  0.0,
@@ -155,7 +172,12 @@ fn init_buffers(gl: &Rc<dyn gl::Gl>, texture_rectangle: bool, texture_width: i32
         0.0,  height,
     ];
 
-    gl.buffer_data_untyped(gl::ARRAY_BUFFER, std::mem::size_of_val(&texture_coordinates) as isize, texture_coordinates.as_ptr() as *const libc::c_void, gl::STATIC_DRAW);
+    gl.buffer_data_untyped(
+        gl::ARRAY_BUFFER,
+        std::mem::size_of_val(&texture_coordinates) as isize,
+        texture_coordinates.as_ptr() as *const libc::c_void,
+        gl::STATIC_DRAW,
+    );
 
     // Build the element array buffer; this specifies the indices
     // into the vertex arrays for each face's vertices.
@@ -167,7 +189,7 @@ fn init_buffers(gl: &Rc<dyn gl::Gl>, texture_rectangle: bool, texture_width: i32
     // This array defines each face as two triangles, using the
     // indices into the vertex array to specify each triangle's
     // position.
-
+    #[rustfmt::skip]
     let indices = [
         0u16,  1,  2,      0,  2,  3,    // front
         4,  5,  6,      4,  6,  7,    // back
@@ -179,8 +201,12 @@ fn init_buffers(gl: &Rc<dyn gl::Gl>, texture_rectangle: bool, texture_width: i32
 
     // Now send the element array to GL
 
-    gl.buffer_data_untyped(gl::ELEMENT_ARRAY_BUFFER, std::mem::size_of_val(&indices) as isize, indices.as_ptr() as *const libc::c_void, gl::STATIC_DRAW);
-
+    gl.buffer_data_untyped(
+        gl::ELEMENT_ARRAY_BUFFER,
+        std::mem::size_of_val(&indices) as isize,
+        indices.as_ptr() as *const libc::c_void,
+        gl::STATIC_DRAW,
+    );
 
     Buffers {
         position: position_buffer,
@@ -192,7 +218,7 @@ fn init_buffers(gl: &Rc<dyn gl::Gl>, texture_rectangle: bool, texture_width: i32
 struct Image {
     data: Vec<u8>,
     width: i32,
-    height: i32
+    height: i32,
 }
 
 fn rgba_to_bgra(buf: &mut [u8]) {
@@ -200,13 +226,13 @@ fn rgba_to_bgra(buf: &mut [u8]) {
     let mut i = 0;
     while i < buf.len() {
         let r = buf[i];
-        let g = buf[i+1];
-        let b = buf[i+2];
-        let a = buf[i+3];
+        let g = buf[i + 1];
+        let b = buf[i + 2];
+        let a = buf[i + 3];
         buf[i] = b;
-        buf[i+1] = g;
-        buf[i+2] = r;
-        buf[i+3] = a;
+        buf[i + 1] = g;
+        buf[i + 2] = r;
+        buf[i + 3] = a;
         i += 4;
     }
 }
@@ -216,9 +242,9 @@ fn make_blue(buf: &mut [u8]) {
     let mut i = 0;
     while i < buf.len() {
         buf[i] = 0xff;
-        buf[i+1] = 0;
-        buf[i+2] = 0;
-        buf[i+3] = 0xff;
+        buf[i + 1] = 0;
+        buf[i + 2] = 0;
+        buf[i + 3] = 0xff;
         i += 4;
     }
 }
@@ -228,9 +254,9 @@ fn make_yellow(buf: &mut [u8]) {
     let mut i = 0;
     while i < buf.len() {
         buf[i] = 0;
-        buf[i+1] = 0xff;
-        buf[i+2] = 0xff;
-        buf[i+3] = 0xff;
+        buf[i + 1] = 0xff;
+        buf[i + 2] = 0xff;
+        buf[i + 3] = 0xff;
         i += 4;
     }
 }
@@ -238,17 +264,15 @@ fn make_yellow(buf: &mut [u8]) {
 fn paint_square(image: &mut Image) {
     let width = image.width as usize;
     for i in 1024..2048 {
-        make_yellow(&mut image.data[i*width..(i*width + 512)]);
+        make_yellow(&mut image.data[i * width..(i * width + 512)]);
     }
-
 }
 
 fn paint_square2(image: &mut Image) {
     let width = image.width as usize;
     for i in 1024..2048 {
-        make_blue(&mut image.data[i*width..(i*width + 512)]);
+        make_blue(&mut image.data[i * width..(i * width + 512)]);
     }
-
 }
 
 fn bpp(format: GLuint) -> i32 {
@@ -258,19 +282,20 @@ fn bpp(format: GLuint) -> i32 {
         gl::FLOAT => 16,
         gl::INT => 16,
         gl::UNSIGNED_INT => 16,
-        _ => panic!()
+        _ => panic!(),
     }
 }
 
-
-
-fn load_image(format: GLuint) -> Image
-{
+fn load_image(format: GLuint) -> Image {
     if true {
         // stride needs to be 32-byte aligned to go fast with client storage
         let width: i32 = 4096;
         let height: i32 = 8192;
-        return Image { data: vec![0; (width * height * bpp(format)) as usize], width, height }
+        return Image {
+            data: vec![0; (width * height * bpp(format)) as usize],
+            width,
+            height,
+        };
     }
     let decoder = png::Decoder::new(std::fs::File::open("cubetexture.png").unwrap());
     let (info, mut reader) = decoder.read_info().unwrap();
@@ -285,7 +310,11 @@ fn load_image(format: GLuint) -> Image
     //make_red(&mut buf);
     //make_yellow(&mut buf);
 
-    Image { data: buf, width: info.width as i32, height: info.height as i32}
+    Image {
+        data: buf,
+        width: info.width as i32,
+        height: info.height as i32,
+    }
 }
 
 struct Texture {
@@ -293,8 +322,15 @@ struct Texture {
     pbo: Option<GLuint>,
 }
 
-
-fn load_texture(gl: &Rc<dyn gl::Gl>, image: &Image, target: GLuint, internal_format: GLuint, src_format: GLuint, src_type: GLuint, options: &Options) -> Texture {
+fn load_texture(
+    gl: &Rc<dyn gl::Gl>,
+    image: &Image,
+    target: GLuint,
+    internal_format: GLuint,
+    src_format: GLuint,
+    src_type: GLuint,
+    options: &Options,
+) -> Texture {
     let texture = gl.gen_textures(1)[0];
 
     gl.bind_texture(target, texture);
@@ -317,15 +353,49 @@ fn load_texture(gl: &Rc<dyn gl::Gl>, image: &Image, target: GLuint, internal_for
 
     if options.texture_array {
         if options.texture_storage {
-            gl.tex_storage_3d(target, 1, internal_format, image.width as i32, image.height as i32, 1);
+            gl.tex_storage_3d(
+                target,
+                1,
+                internal_format,
+                image.width as i32,
+                image.height as i32,
+                1,
+            );
         } else {
-            gl.tex_image_3d(target, level, internal_format as i32, image.width, image.height, 1, border, src_format, src_type, if options.pbo { None } else { Some(&image.data[..]) });
+            gl.tex_image_3d(
+                target,
+                level,
+                internal_format as i32,
+                image.width,
+                image.height,
+                1,
+                border,
+                src_format,
+                src_type,
+                None,
+            );
         }
     } else {
         if options.texture_storage {
-            gl.tex_storage_2d(target, 1, internal_format, image.width as i32, image.height as i32);
+            gl.tex_storage_2d(
+                target,
+                1,
+                internal_format,
+                image.width as i32,
+                image.height as i32,
+            );
         } else {
-            gl.tex_image_2d(target, level, internal_format as i32, image.width, image.height, border, src_format, src_type, if options.pbo { None } else { Some(&image.data[..]) });
+            gl.tex_image_2d(
+                target,
+                level,
+                internal_format as i32,
+                image.width,
+                image.height,
+                border,
+                src_format,
+                src_type,
+                None,
+            );
         }
     }
 
@@ -349,7 +419,12 @@ fn load_texture(gl: &Rc<dyn gl::Gl>, image: &Image, target: GLuint, internal_for
         let id = gl.gen_buffers(1)[0];
         // WebRender on Mac uses DYNAMIC_DRAW
         gl.bind_buffer(gl::PIXEL_UNPACK_BUFFER, id);
-        gl.buffer_data_untyped(gl::PIXEL_UNPACK_BUFFER, (image.width * image.height * bpp(src_type)) as _, image.data[..].as_ptr() as *const libc::c_void, gl::DYNAMIC_DRAW);
+        gl.buffer_data_untyped(
+            gl::PIXEL_UNPACK_BUFFER,
+            (image.width * image.height * bpp(src_type)) as _,
+            std::ptr::null() as _,
+            gl::DYNAMIC_DRAW,
+        );
 
         if options.texture_array {
             gl.tex_sub_image_3d_pbo(
@@ -386,13 +461,14 @@ fn load_texture(gl: &Rc<dyn gl::Gl>, image: &Image, target: GLuint, internal_for
     Texture { id: texture, pbo }
 }
 
-
 fn load_shader(gl: &Rc<dyn Gl>, shader_type: gl::GLenum, source: &[u8]) -> gl::GLuint {
     let shader = gl.create_shader(shader_type);
     gl.shader_source(shader, &[source]);
     gl.compile_shader(shader);
     let mut status = [0];
-    unsafe { gl.get_shader_iv(shader, gl::COMPILE_STATUS, &mut status); }
+    unsafe {
+        gl.get_shader_iv(shader, gl::COMPILE_STATUS, &mut status);
+    }
     if status[0] == 0 {
         println!("{}", gl.get_shader_info_log(shader));
         panic!();
@@ -401,17 +477,19 @@ fn load_shader(gl: &Rc<dyn Gl>, shader_type: gl::GLenum, source: &[u8]) -> gl::G
 }
 
 fn allow_gpu_switching() {
-    use core_foundation::string::CFString;
     use core_foundation::base::TCFType;
     use core_foundation::boolean::CFBoolean;
+    use core_foundation::string::CFString;
 
     let i = core_foundation::bundle::CFBundle::main_bundle().info_dictionary();
     let mut i = unsafe { i.to_mutable() };
-    i.set(CFString::new("NSSupportsAutomaticGraphicsSwitching"), CFBoolean::true_value().into_CFType());
+    i.set(
+        CFString::new("NSSupportsAutomaticGraphicsSwitching"),
+        CFBoolean::true_value().into_CFType(),
+    );
 }
 
 fn main() {
-
     allow_gpu_switching();
 
     let events_loop = glutin::event_loop::EventLoop::new();
@@ -430,20 +508,39 @@ fn main() {
 
     let gl_window = unsafe { gl_window.make_current().unwrap() };
 
-    let options = Options { pbo: false, client_storage: true, texture_array: false, texture_storage: false, swizzle: false };
+    let options = Options {
+        pbo: true,
+        pbo_reallocate_buffer: true,
+        client_storage: false,
+        texture_array: false,
+        texture_storage: false,
+        swizzle: false,
+    };
 
     let texture_rectangle = true;
     let apple_format = true; // on Intel it looks like we don't need this particular format
 
-    let texture_target = if texture_rectangle { gl::TEXTURE_RECTANGLE_ARB } else { gl::TEXTURE_2D };
-    let texture_target = if options.texture_array { gl::TEXTURE_2D_ARRAY} else { texture_target };
+    let texture_target = if texture_rectangle {
+        gl::TEXTURE_RECTANGLE_ARB
+    } else {
+        gl::TEXTURE_2D
+    };
+    let texture_target = if options.texture_array {
+        gl::TEXTURE_2D_ARRAY
+    } else {
+        texture_target
+    };
 
     //let texture_internal_format = gl::RGBA32UI;
     //let texture_internal_format = gl::RGBA32F;
     let texture_internal_format = gl::RGBA8;
 
     let mut texture_src_format = if apple_format { gl::BGRA } else { gl::RGBA };
-    let mut texture_src_type = if apple_format { gl::UNSIGNED_INT_8_8_8_8_REV } else { gl::UNSIGNED_BYTE };
+    let mut texture_src_type = if apple_format {
+        gl::UNSIGNED_INT_8_8_8_8_REV
+    } else {
+        gl::UNSIGNED_BYTE
+    };
 
     // adjust type and format to match internal format
     if texture_internal_format == gl::RGBA32UI {
@@ -453,7 +550,6 @@ fn main() {
         texture_src_format = gl::RGBA;
         texture_src_type = gl::FLOAT;
     }
-
 
     let vs_source = b"
     #version 140
@@ -475,7 +571,9 @@ fn main() {
     } else {
         ("sampler2D", "v_texture_coord")
     };
-    let fs_source = format!("
+
+    let fs_source = format!(
+        "
     #version 140
 
     in vec2 v_texture_coord;
@@ -484,14 +582,16 @@ fn main() {
     void main(void) {{
         fragment_color = texture(u_sampler, {});
     }}
-    ", sampler, coord).into_bytes();
+    ",
+        sampler, coord
+    )
+    .into_bytes();
 
-
-    let glc = unsafe { gl::GlFns::load_with(|symbol| gl_window.get_proc_address(symbol) as *const _) };
-    let gl = ErrorCheckingGl::wrap(glc);// Rc::get_mut(&mut glc).unwrap();
+    let glc =
+        unsafe { gl::GlFns::load_with(|symbol| gl_window.get_proc_address(symbol) as *const _) };
+    let gl = ErrorCheckingGl::wrap(glc); // Rc::get_mut(&mut glc).unwrap();
 
     let shader_program = init_shader_program(&gl, vs_source, &fs_source);
-
 
     let vertex_position = gl.get_attrib_location(shader_program, "a_vertex_position");
     let texture_coord = gl.get_attrib_location(shader_program, "a_texture_coord");
@@ -500,39 +600,47 @@ fn main() {
     let model_view_matrix_loc = gl.get_uniform_location(shader_program, "u_model_view_matrix");
     let u_sampler = gl.get_uniform_location(shader_program, "u_sampler");
 
-
     let mut image = load_image(texture_src_type);
     let buffers = init_buffers(&gl, texture_rectangle, image.width, image.height);
 
-
-    let texture = load_texture(&gl, &image,
-                               texture_target,
-                               texture_internal_format,
-                               texture_src_format,
-                               texture_src_type,
-                               &options);
+    let texture = load_texture(
+        &gl,
+        &image,
+        texture_target,
+        texture_internal_format,
+        texture_src_format,
+        texture_src_type,
+        &options,
+    );
 
     let vao = gl.gen_vertex_arrays(1)[0];
     gl.bind_vertex_array(vao);
 
-
     let mut cube_rotation: f32 = 0.;
+
+    let now = Instant::now();
+    let mut frame = 0;
 
     events_loop.run(move |event, _, control_flow| {
         match event {
-            Event::LoopDestroyed => return,
+            Event::LoopDestroyed => {
+                let elapsed = now.elapsed();
+                println!("{:?}", elapsed);
+                return;
+            }
             Event::WindowEvent { event, .. } => match event {
-                WindowEvent::Resized(physical_size) => {
-                    gl_window.resize(physical_size)
-                }
-                WindowEvent::CloseRequested => {
-                    *control_flow = ControlFlow::Exit
-                }
+                WindowEvent::Resized(physical_size) => gl_window.resize(physical_size),
+                WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
                 _ => (),
             },
-            _ => ()
+            _ => (),
         }
 
+        frame += 1;
+        if frame > 50 {
+            // Uncomment line below to enable benchmark mode.
+            // *control_flow = ControlFlow::Exit;
+        }
         // Bind the texture to texture unit 0
         gl.bind_texture(texture_target, texture.id);
 
@@ -541,13 +649,34 @@ fn main() {
             if options.pbo {
                 let id = texture.pbo.unwrap();
                 gl.bind_buffer(gl::PIXEL_UNPACK_BUFFER, id);
-                if true {
-                    //gl.buffer_sub_data_untyped(gl::PIXEL_UNPACK_BUFFER, 0, (image.width * image.height * 4) as _, image.data[..].as_ptr() as *const libc::c_void);
-                    gl.buffer_data_untyped(gl::PIXEL_UNPACK_BUFFER, (image.width * image.height * bpp(texture_src_type)) as _, image.data[..].as_ptr() as *const libc::c_void, gl::DYNAMIC_DRAW);
 
+                let size = image.width * image.height * bpp(texture_src_type);
+
+                if options.pbo_reallocate_buffer {
+                    gl.buffer_data_untyped(
+                        gl::PIXEL_UNPACK_BUFFER,
+                        size as _,
+                        image.data[..].as_ptr() as _,
+                        gl::DYNAMIC_DRAW,
+                    );
                 } else {
-                    //gl.map_buffer(gl::PIXEL_UNPACK_BUFFER, gl::WRITE_ONLY);
+                    let buffer = gl.map_buffer_range(
+                        gl::PIXEL_UNPACK_BUFFER,
+                        0,
+                        size as _,
+                        gl::MAP_WRITE_BIT | gl::MAP_INVALIDATE_BUFFER_BIT,
+                    );
+
+                    if buffer != ptr::null_mut() {
+                        let src = &image.data;
+                        unsafe {
+                            ptr::copy_nonoverlapping(src.as_ptr(), buffer as *mut u8, src.len());
+                        }
+                    }
+
+                    gl.unmap_buffer(gl::PIXEL_UNPACK_BUFFER);
                 }
+
                 if options.texture_array {
                     gl.tex_sub_image_3d_pbo(
                         texture_target,
@@ -581,13 +710,21 @@ fn main() {
                     //gl.tex_parameter_i(texture_target, gl::TEXTURE_STORAGE_HINT_APPLE, gl::STORAGE_CACHED_APPLE as gl::GLint);
                     //gl.pixel_store_i(gl::UNPACK_CLIENT_STORAGE_APPLE, true as gl::GLint);
                 }
-                gl.tex_sub_image_2d(texture_target, level, 0, 0, image.width, image.height, texture_src_format, texture_src_type, &image.data[..]);
+                gl.tex_sub_image_2d(
+                    texture_target,
+                    level,
+                    0,
+                    0,
+                    image.width,
+                    image.height,
+                    texture_src_format,
+                    texture_src_type,
+                    &image.data[..],
+                );
                 // sub image uploads are still fast as long as the memory is in the same place
                 //gl.tex_sub_image_2d(texture_target, level, 0, 256, image.width, 4096, texture_src_format, texture_src_type, &image.data[image.width as usize *4*256..image.width as usize *4*4096]);
-
             }
         }
-
 
         gl.clear_color(1., 0., 0., 1.);
         gl.clear_depth(1.);
@@ -603,7 +740,7 @@ fn main() {
         // and we only want to see objects between 0.1 units
         // and 100 units away from the camera.
 
-        let field_of_view = 45. * std::f32::consts::PI / 180.;   // in radians
+        let field_of_view = 45. * std::f32::consts::PI / 180.; // in radians
         let width = 1024.;
         let height = 768.;
         let aspect = width / height;
@@ -616,6 +753,7 @@ fn main() {
         let f = 1. / (fovy / 2.).tan();
         let nf = 1. / (near - far);
 
+        #[rustfmt::skip]
         let projection_matrix = Transform3D::<f32>::row_major(
             f / aspect, 0., 0., 0.,
             0.,  f, 0., 0.,
@@ -625,8 +763,10 @@ fn main() {
 
         let mut model_view_matrix = Transform3D::<f32>::identity();
         model_view_matrix = model_view_matrix.post_translate(Vector3D::new(-0., 0., -6.0));
-        model_view_matrix = model_view_matrix.pre_rotate(0., 0., 1., euclid::Angle::radians(cube_rotation));
-        model_view_matrix = model_view_matrix.pre_rotate(0., 1., 0., euclid::Angle::radians(cube_rotation * 0.7));
+        model_view_matrix =
+            model_view_matrix.pre_rotate(0., 0., 1., euclid::Angle::radians(cube_rotation));
+        model_view_matrix =
+            model_view_matrix.pre_rotate(0., 1., 0., euclid::Angle::radians(cube_rotation * 0.7));
 
         {
             let num_components = 3;
@@ -635,7 +775,14 @@ fn main() {
             let stride = 0;
             let offset = 0;
             gl.bind_buffer(gl::ARRAY_BUFFER, buffers.position);
-            gl.vertex_attrib_pointer(vertex_position as u32, num_components, ty, normalize, stride, offset);
+            gl.vertex_attrib_pointer(
+                vertex_position as u32,
+                num_components,
+                ty,
+                normalize,
+                stride,
+                offset,
+            );
             gl.enable_vertex_attrib_array(vertex_position as u32);
         }
 
@@ -646,7 +793,14 @@ fn main() {
             let stride = 0;
             let offset = 0;
             gl.bind_buffer(gl::ARRAY_BUFFER, buffers.texture_coord);
-            gl.vertex_attrib_pointer(texture_coord as u32, num_components, ty, normalize, stride, offset);
+            gl.vertex_attrib_pointer(
+                texture_coord as u32,
+                num_components,
+                ty,
+                normalize,
+                stride,
+                offset,
+            );
             gl.enable_vertex_attrib_array(texture_coord as u32);
         }
 
@@ -657,18 +811,19 @@ fn main() {
         gl.uniform_matrix_4fv(
             projection_matrix_loc,
             false,
-            &projection_matrix.to_row_major_array());
+            &projection_matrix.to_row_major_array(),
+        );
 
         gl.uniform_matrix_4fv(
             model_view_matrix_loc,
             false,
-            &model_view_matrix.to_row_major_array());
+            &model_view_matrix.to_row_major_array(),
+        );
 
         // Specify the texture to map onto the faces.
 
         // Tell OpenGL we want to affect texture unit 0
         gl.active_texture(gl::TEXTURE0);
-
 
         gl.uniform_1i(u_sampler, 0);
 
@@ -678,18 +833,8 @@ fn main() {
             let offset = 0;
             gl.draw_elements(gl::TRIANGLES, vertex_count, ty, offset);
         }
-        //paint_square(&mut image);
-        gl_window.swap_buffers().unwrap();
-        /*
-        let mut count = 0;
-        gl.finish_object_apple(gl::TEXTURE, texture.id);
-        while gl.test_object_apple(gl::TEXTURE, texture.id) == 0 {
-            count += 1
-        }
-                println!("test {}", count);
 
-        */
-        //paint_square2(&mut image);
+        gl_window.swap_buffers().unwrap();
 
         cube_rotation += 0.1;
     });
