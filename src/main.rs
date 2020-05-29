@@ -41,6 +41,7 @@ struct Options {
     texture_array: bool,
     texture_storage: bool,
     swizzle: bool,
+    benchmark: bool,
 }
 
 fn init_shader_program(gl: &Rc<dyn Gl>, vs_source: &[u8], fs_source: &[u8]) -> gl::GLuint {
@@ -290,7 +291,7 @@ fn load_image(format: GLuint) -> Image {
     if true {
         // stride needs to be 32-byte aligned to go fast with client storage
         let width: i32 = 4096;
-        let height: i32 = 8192;
+        let height: i32 = 2048;
         return Image {
             data: vec![0; (width * height * bpp(format)) as usize],
             width,
@@ -338,7 +339,7 @@ fn load_texture(
     let level = 0;
     let border = 0;
 
-    if options.client_storage {
+    let local_buffer = if options.client_storage {
         //gl.texture_range_apple(target, &image.data[..]);
 
         // both of these seem to work ok on Intel
@@ -349,7 +350,11 @@ fn load_texture(
 
         // this may not be needed
         gl.pixel_store_i(gl::UNPACK_ROW_LENGTH, 0);
-    }
+
+        Some(&image.data[..])
+    } else {
+        None
+    };
 
     if options.texture_array {
         if options.texture_storage {
@@ -372,7 +377,7 @@ fn load_texture(
                 border,
                 src_format,
                 src_type,
-                None,
+                local_buffer,
             );
         }
     } else {
@@ -394,7 +399,7 @@ fn load_texture(
                 border,
                 src_format,
                 src_type,
-                None,
+                local_buffer,
             );
         }
     }
@@ -495,10 +500,10 @@ fn main() {
     let events_loop = glutin::event_loop::EventLoop::new();
     let window_builder = glutin::window::WindowBuilder::new()
         .with_title("Hello, world!")
-        .with_inner_size(glutin::dpi::LogicalSize::new(1024.0, 768.0));
+        .with_inner_size(glutin::dpi::LogicalSize::new(1920.0, 1080.0));
 
     let gl_window = glutin::ContextBuilder::new()
-        .with_vsync(true)
+        .with_vsync(false)
         .with_gl(glutin::GlRequest::GlThenGles {
             opengl_version: (3, 2),
             opengles_version: (3, 0),
@@ -509,12 +514,13 @@ fn main() {
     let gl_window = unsafe { gl_window.make_current().unwrap() };
 
     let options = Options {
-        pbo: true,
-        pbo_reallocate_buffer: true,
-        client_storage: false,
+        pbo: false,
+        pbo_reallocate_buffer: false,
+        client_storage: true,
         texture_array: false,
         texture_storage: false,
         swizzle: false,
+        benchmark: false,
     };
 
     let texture_rectangle = true;
@@ -636,11 +642,13 @@ fn main() {
             _ => (),
         }
 
-        frame += 1;
-        if frame > 50 {
-            // Uncomment line below to enable benchmark mode.
-            // *control_flow = ControlFlow::Exit;
+        if options.benchmark {
+            frame += 1;
+            if frame > 200 {
+                *control_flow = ControlFlow::Exit;
+            }
         }
+
         // Bind the texture to texture unit 0
         gl.bind_texture(texture_target, texture.id);
 
