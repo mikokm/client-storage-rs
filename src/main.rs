@@ -7,9 +7,7 @@ extern crate libc;
 use euclid::{Transform3D, Vector3D};
 
 use gleam::gl;
-use gleam::gl::ErrorCheckingGl;
-use gleam::gl::GLuint;
-use gleam::gl::Gl;
+use gleam::gl::{ErrorCheckingGl, GLsync, GLuint, Gl};
 
 use glutin::event::{Event, WindowEvent};
 use glutin::event_loop::ControlFlow;
@@ -320,7 +318,6 @@ fn load_image(format: GLuint) -> Image {
 
 struct Texture {
     id: GLuint,
-    pbo: Option<GLuint>,
 }
 
 fn load_texture(
@@ -420,50 +417,7 @@ fn load_texture(
         gl.tex_parameter_i(target, gl::TEXTURE_SWIZZLE_A, components[3] as i32);
     }
 
-    let pbo = if options.pbo {
-        let id = gl.gen_buffers(1)[0];
-        // WebRender on Mac uses DYNAMIC_DRAW
-        gl.bind_buffer(gl::PIXEL_UNPACK_BUFFER, id);
-        gl.buffer_data_untyped(
-            gl::PIXEL_UNPACK_BUFFER,
-            (image.width * image.height * bpp(src_type)) as _,
-            std::ptr::null() as _,
-            gl::DYNAMIC_DRAW,
-        );
-
-        if options.texture_array {
-            gl.tex_sub_image_3d_pbo(
-                target,
-                level,
-                0,
-                0,
-                0,
-                image.width,
-                image.height,
-                1,
-                src_format,
-                src_type,
-                0,
-            );
-        } else {
-            gl.tex_sub_image_2d_pbo(
-                target,
-                level,
-                0,
-                0,
-                image.width,
-                image.height,
-                src_format,
-                src_type,
-                0,
-            );
-        }
-        gl.bind_buffer(gl::PIXEL_UNPACK_BUFFER, 0);
-        Some(id)
-    } else {
-        None
-    };
-    Texture { id: texture, pbo }
+    Texture { id: texture }
 }
 
 fn load_shader(gl: &Rc<dyn Gl>, shader_type: gl::GLenum, source: &[u8]) -> gl::GLuint {
@@ -494,6 +448,70 @@ fn allow_gpu_switching() {
     );
 }
 
+struct PBO {
+    fence: Option<GLsync>,
+    id: GLuint,
+    size: usize,
+}
+
+impl PBO {
+    fn new(gl: &Rc<dyn Gl>, size: usize) -> Self {
+        let id = gl.gen_buffers(1)[0];
+
+        gl.bind_buffer(gl::PIXEL_UNPACK_BUFFER, id);
+        gl.buffer_data_untyped(
+            gl::PIXEL_UNPACK_BUFFER,
+            size as _,
+            std::ptr::null() as _,
+            gl::DYNAMIC_DRAW,
+        );
+        gl.bind_buffer(gl::PIXEL_UNPACK_BUFFER, 0);
+
+        PBO {
+            fence: None,
+            id: id,
+            size: size,
+        }
+    }
+
+    fn reallocate_buffer(&mut self, gl: &Rc<dyn Gl>, image: &Image) {
+        gl.buffer_data_untyped(
+            gl::PIXEL_UNPACK_BUFFER,
+            self.size as _,
+            image.data[..].as_ptr() as _,
+            gl::DYNAMIC_DRAW,
+        );
+    }
+
+    fn update(&mut self, gl: &Rc<dyn Gl>, image: &Image) {
+        let buffer = gl.map_buffer_range(
+            gl::PIXEL_UNPACK_BUFFER,
+            0,
+            self.size as _,
+            gl::MAP_WRITE_BIT | gl::MAP_UNSYNCHRONIZED_BIT | gl::MAP_INVALIDATE_BUFFER_BIT,
+        );
+
+        if buffer != ptr::null_mut() {
+            let src = &image.data;
+            unsafe {
+                ptr::copy_nonoverlapping(src.as_ptr(), buffer as *mut u8, src.len());
+            }
+        }
+
+        gl.unmap_buffer(gl::PIXEL_UNPACK_BUFFER);
+
+        let fence = gl.fence_sync(gl::SYNC_GPU_COMMANDS_COMPLETE, 0);
+        self.fence = Some(fence);
+    }
+
+    fn wait(&mut self, gl: &Rc<dyn Gl>) {
+        if let Some(fence) = self.fence.take() {
+            gl.client_wait_sync(fence, 0, 1_000_000_000);
+            gl.delete_sync(fence);
+        }
+    }
+}
+
 fn main() {
     allow_gpu_switching();
 
@@ -514,9 +532,9 @@ fn main() {
     let gl_window = unsafe { gl_window.make_current().unwrap() };
 
     let options = Options {
-        pbo: false,
+        pbo: true,
         pbo_reallocate_buffer: false,
-        client_storage: true,
+        client_storage: false,
         texture_array: false,
         texture_storage: false,
         swizzle: false,
@@ -627,11 +645,20 @@ fn main() {
     let now = Instant::now();
     let mut frame = 0;
 
+    let size = (image.width * image.height * bpp(texture_src_type)) as usize;
+    let pbo_count = 2;
+
+    let mut pbos = Vec::new();
+    pbos.resize_with(pbo_count, || PBO::new(&gl, size));
+    let mut pbo_index = 0;
+
     events_loop.run(move |event, _, control_flow| {
         match event {
             Event::LoopDestroyed => {
-                let elapsed = now.elapsed();
-                println!("{:?}", elapsed);
+                if options.benchmark {
+                    let elapsed = now.elapsed();
+                    println!("{:?}", elapsed);
+                }
                 return;
             }
             Event::WindowEvent { event, .. } => match event {
@@ -653,37 +680,16 @@ fn main() {
         gl.bind_texture(texture_target, texture.id);
 
         {
+            let read_index = pbo_index;
+            pbo_index = (pbo_index + 1) % pbo_count;
+            let write_index = pbo_index;
+
             let level = 0;
             if options.pbo {
-                let id = texture.pbo.unwrap();
-                gl.bind_buffer(gl::PIXEL_UNPACK_BUFFER, id);
+                let read_pbo = &mut pbos[read_index];
+                gl.bind_buffer(gl::PIXEL_UNPACK_BUFFER, read_pbo.id);
 
-                let size = image.width * image.height * bpp(texture_src_type);
-
-                if options.pbo_reallocate_buffer {
-                    gl.buffer_data_untyped(
-                        gl::PIXEL_UNPACK_BUFFER,
-                        size as _,
-                        image.data[..].as_ptr() as _,
-                        gl::DYNAMIC_DRAW,
-                    );
-                } else {
-                    let buffer = gl.map_buffer_range(
-                        gl::PIXEL_UNPACK_BUFFER,
-                        0,
-                        size as _,
-                        gl::MAP_WRITE_BIT | gl::MAP_INVALIDATE_BUFFER_BIT,
-                    );
-
-                    if buffer != ptr::null_mut() {
-                        let src = &image.data;
-                        unsafe {
-                            ptr::copy_nonoverlapping(src.as_ptr(), buffer as *mut u8, src.len());
-                        }
-                    }
-
-                    gl.unmap_buffer(gl::PIXEL_UNPACK_BUFFER);
-                }
+                read_pbo.wait(&gl);
 
                 if options.texture_array {
                     gl.tex_sub_image_3d_pbo(
@@ -712,6 +718,19 @@ fn main() {
                         0,
                     );
                 }
+
+                let write_pbo = &mut pbos[write_index];
+
+                if read_index != write_index {
+                    gl.bind_buffer(gl::PIXEL_UNPACK_BUFFER, write_pbo.id);
+                }
+
+                if options.pbo_reallocate_buffer {
+                    write_pbo.reallocate_buffer(&gl, &image);
+                } else {
+                    write_pbo.update(&gl, &image);
+                }
+
                 gl.bind_buffer(gl::PIXEL_UNPACK_BUFFER, 0);
             } else {
                 if options.client_storage {
@@ -844,6 +863,7 @@ fn main() {
 
         gl_window.swap_buffers().unwrap();
 
+        paint_square(&mut image);
         cube_rotation += 0.1;
     });
 }
