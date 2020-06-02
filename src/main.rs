@@ -532,16 +532,17 @@ fn main() {
     let gl_window = unsafe { gl_window.make_current().unwrap() };
 
     let options = Options {
-        pbo: true,
+        pbo: false,
         pbo_reallocate_buffer: false,
-        client_storage: false,
+        client_storage: true,
         texture_array: false,
         texture_storage: false,
         swizzle: false,
-        benchmark: false,
+        benchmark: true,
     };
+    let pbo_count = 2;
 
-    let texture_rectangle = true;
+    let texture_rectangle = false;
     let apple_format = true; // on Intel it looks like we don't need this particular format
 
     let texture_target = if texture_rectangle {
@@ -646,11 +647,11 @@ fn main() {
     let mut frame = 0;
 
     let size = (image.width * image.height * bpp(texture_src_type)) as usize;
-    let pbo_count = 2;
-
     let mut pbos = Vec::new();
     pbos.resize_with(pbo_count, || PBO::new(&gl, size));
     let mut pbo_index = 0;
+
+    let mut client_storage_fence: Option<GLsync> = None;
 
     events_loop.run(move |event, _, control_flow| {
         match event {
@@ -675,6 +676,14 @@ fn main() {
                 *control_flow = ControlFlow::Exit;
             }
         }
+
+        if let Some(fence) = client_storage_fence.take() {
+            gl.client_wait_sync(fence, 0, 1_000_000_000);
+            gl.delete_sync(fence);
+        }
+
+        // Update the texture data
+        paint_square(&mut image);
 
         // Bind the texture to texture unit 0
         gl.bind_texture(texture_target, texture.id);
@@ -733,21 +742,38 @@ fn main() {
 
                 gl.bind_buffer(gl::PIXEL_UNPACK_BUFFER, 0);
             } else {
-                if options.client_storage {
-                    //gl.tex_parameter_i(texture_target, gl::TEXTURE_STORAGE_HINT_APPLE, gl::STORAGE_CACHED_APPLE as gl::GLint);
-                    //gl.pixel_store_i(gl::UNPACK_CLIENT_STORAGE_APPLE, true as gl::GLint);
+                if options.texture_array {
+                    gl.tex_sub_image_3d(
+                        texture_target,
+                        level,
+                        0,
+                        0,
+                        0,
+                        image.width,
+                        image.height,
+                        1,
+                        texture_src_format,
+                        texture_src_type,
+                        &image.data[..],
+                    );
+                } else {
+                    gl.tex_sub_image_2d(
+                        texture_target,
+                        level,
+                        0,
+                        0,
+                        image.width,
+                        image.height,
+                        texture_src_format,
+                        texture_src_type,
+                        &image.data[..],
+                    );
                 }
-                gl.tex_sub_image_2d(
-                    texture_target,
-                    level,
-                    0,
-                    0,
-                    image.width,
-                    image.height,
-                    texture_src_format,
-                    texture_src_type,
-                    &image.data[..],
-                );
+
+                if options.client_storage {
+                    client_storage_fence = Some(gl.fence_sync(gl::SYNC_GPU_COMMANDS_COMPLETE, 0));
+                }
+
                 // sub image uploads are still fast as long as the memory is in the same place
                 //gl.tex_sub_image_2d(texture_target, level, 0, 256, image.width, 4096, texture_src_format, texture_src_type, &image.data[image.width as usize *4*256..image.width as usize *4*4096]);
             }
@@ -863,7 +889,6 @@ fn main() {
 
         gl_window.swap_buffers().unwrap();
 
-        paint_square(&mut image);
         cube_rotation += 0.1;
     });
 }
