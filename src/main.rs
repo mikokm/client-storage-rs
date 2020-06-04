@@ -40,6 +40,7 @@ struct Options {
     pbo: bool,
     pbo_count: usize,
     pbo_reallocate_buffer: bool,
+    pbo_no_copy: bool,
     client_storage: bool,
     texture_array: bool,
     texture_rectangle: bool,
@@ -53,6 +54,7 @@ fn parse_options() -> Options {
     let matches = App::new("client-storage")
         .arg("--pbo [count]")
         .arg("--pbo-reallocate-buffer")
+        .arg("--pbo-no-copy")
         .arg("--client-storage")
         .arg("--texture-array")
         .arg("--texture-storage")
@@ -71,6 +73,7 @@ fn parse_options() -> Options {
         pbo: pbo_count > 0,
         pbo_count: pbo_count,
         pbo_reallocate_buffer: matches.is_present("pbo-reallocate-buffer"),
+        pbo_no_copy: matches.is_present("pbo-no-copy"),
         client_storage: matches.is_present("client-storage"),
         texture_array: matches.is_present("texture-array"),
         texture_storage: matches.is_present("texture-storage"),
@@ -83,6 +86,7 @@ fn parse_options() -> Options {
 
 fn validate_options(options: &Options) {
     assert!(!(options.pbo && options.client_storage));
+    assert!(!(options.pbo_no_copy && !options.pbo));
     assert!(!(options.texture_array && options.texture_rectangle));
 }
 
@@ -304,6 +308,16 @@ fn make_yellow(buf: &mut [u8]) {
     }
 }
 
+fn rotate_color(buf: &mut [u8], color: u8) {
+    assert!(buf.len() % 32 == 0);
+    for i in (0..buf.len() - 1).step_by(4) {
+        buf[i + 0] = color;
+        buf[i + 1] = 0x00;
+        buf[i + 2] = 0x00;
+        buf[i + 3] = 0xFF;
+    }
+}
+
 fn paint_square(image: &mut Image) {
     let width = image.width as usize;
     for i in 1024..2048 {
@@ -332,7 +346,7 @@ fn bpp(format: GLuint) -> i32 {
 fn load_image(format: GLuint) -> Image {
     if true {
         // stride needs to be 32-byte aligned to go fast with client storage
-        let width: i32 = 4096;
+        let width: i32 = 2048;
         let height: i32 = 2048;
         return Image {
             data: vec![0; (width * height * bpp(format)) as usize],
@@ -527,7 +541,7 @@ impl PBO {
         );
     }
 
-    fn update(&mut self, gl: &Rc<dyn Gl>, image: &Image) {
+    fn update(&mut self, gl: &Rc<dyn Gl>, image: Option<&Image>, color: Option<u8>) {
         let buffer = gl.map_buffer_range(
             gl::PIXEL_UNPACK_BUFFER,
             0,
@@ -536,9 +550,23 @@ impl PBO {
         );
 
         if buffer != ptr::null_mut() {
-            let src = &image.data;
-            unsafe {
-                ptr::copy_nonoverlapping(src.as_ptr(), buffer as *mut u8, src.len());
+            let buffer = buffer as *mut u8;
+
+            match (image, color) {
+                (Some(image), None) => {
+                    let src = &image.data;
+                    unsafe {
+                        ptr::copy_nonoverlapping(src.as_ptr(), buffer, src.len());
+                    }
+                }
+                (None, Some(color)) => {
+                    let mut slice = unsafe {
+                        std::slice::from_raw_parts_mut(buffer, self.size)
+                    };
+
+                    rotate_color(&mut slice, color);
+                }
+                _ => unreachable!(),
             }
         }
 
@@ -565,7 +593,7 @@ fn main() {
         .with_inner_size(glutin::dpi::LogicalSize::new(1920.0, 1080.0));
 
     let gl_window = glutin::ContextBuilder::new()
-        .with_vsync(false)
+        .with_vsync(true)
         .with_gl(glutin::GlRequest::GlThenGles {
             opengl_version: (3, 2),
             opengles_version: (3, 0),
@@ -582,6 +610,7 @@ fn main() {
             pbo: false,
             pbo_count: 1,
             pbo_reallocate_buffer: false,
+            pbo_no_copy: false,
             client_storage: true,
             texture_array: false,
             texture_storage: false,
@@ -597,7 +626,7 @@ fn main() {
 
     validate_options(&options);
 
-    const BENCHMARK_FRAMES: usize = 300;
+    const BENCHMARK_FRAMES: usize = 200;
 
     let texture_target = if options.texture_rectangle {
         gl::TEXTURE_RECTANGLE_ARB
@@ -702,6 +731,7 @@ fn main() {
     gl.bind_vertex_array(vao);
 
     let mut cube_rotation: f32 = 0.;
+    let mut cube_color: u8 = 0;
 
     let now = Instant::now();
     let mut frame = 0;
@@ -745,7 +775,9 @@ fn main() {
         }
 
         // Update the texture data
-        paint_square(&mut image);
+        if !options.pbo_no_copy {
+            rotate_color(&mut image.data, cube_color);
+        }
 
         // Bind the texture to texture unit 0
         gl.bind_texture(texture_target, texture.id);
@@ -800,7 +832,13 @@ fn main() {
                 if options.pbo_reallocate_buffer {
                     write_pbo.reallocate_buffer(&gl, &image);
                 } else {
-                    write_pbo.update(&gl, &image);
+                    let (image, color) = if options.pbo_no_copy {
+                        (None, Some(cube_color))
+                    } else {
+                        (Some(&image), None)
+                    };
+
+                    write_pbo.update(&gl, image, color);
                 }
 
                 gl.bind_buffer(gl::PIXEL_UNPACK_BUFFER, 0);
@@ -953,5 +991,6 @@ fn main() {
         gl_window.swap_buffers().unwrap();
 
         cube_rotation += 0.1;
+        cube_color = (cube_color + 1) % 255;
     });
 }
