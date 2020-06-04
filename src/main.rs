@@ -1,3 +1,4 @@
+extern crate clap;
 extern crate core_foundation;
 extern crate euclid;
 extern crate gleam;
@@ -11,6 +12,8 @@ use gleam::gl::{ErrorCheckingGl, GLsync, GLuint, Gl};
 
 use glutin::event::{Event, WindowEvent};
 use glutin::event_loop::ControlFlow;
+
+use clap::App;
 
 use std::ptr;
 use std::rc::Rc;
@@ -32,14 +35,55 @@ _platform_memmove under glrUpdateTexture.
 
 */
 
+#[derive(Debug)]
 struct Options {
     pbo: bool,
+    pbo_count: usize,
     pbo_reallocate_buffer: bool,
     client_storage: bool,
     texture_array: bool,
+    texture_rectangle: bool,
     texture_storage: bool,
+    apple_format: bool,
     swizzle: bool,
     benchmark: bool,
+}
+
+fn parse_options() -> Options {
+    let matches = App::new("client-storage")
+        .arg("--pbo [count]")
+        .arg("--pbo-reallocate-buffer")
+        .arg("--client-storage")
+        .arg("--texture-array")
+        .arg("--texture-storage")
+        .arg("--texture-rectangle")
+        .arg("--apple-format")
+        .arg("--swizzle")
+        .arg("--benchmark")
+        .get_matches();
+
+    let pbo_count = matches
+        .value_of("pbo")
+        .map(|x| x.parse::<usize>().unwrap())
+        .unwrap_or(0);
+
+    Options {
+        pbo: pbo_count > 0,
+        pbo_count: pbo_count,
+        pbo_reallocate_buffer: matches.is_present("pbo-reallocate-buffer"),
+        client_storage: matches.is_present("client-storage"),
+        texture_array: matches.is_present("texture-array"),
+        texture_storage: matches.is_present("texture-storage"),
+        texture_rectangle: matches.is_present("texture-rectangle"),
+        apple_format: matches.is_present("apple-format"),
+        swizzle: matches.is_present("swizzle"),
+        benchmark: matches.is_present("benchmark"),
+    }
+}
+
+fn validate_options(options: &Options) {
+    assert!(!(options.pbo && options.client_storage));
+    assert!(!(options.texture_array && options.texture_rectangle));
 }
 
 fn init_shader_program(gl: &Rc<dyn Gl>, vs_source: &[u8], fs_source: &[u8]) -> gl::GLuint {
@@ -531,21 +575,29 @@ fn main() {
 
     let gl_window = unsafe { gl_window.make_current().unwrap() };
 
-    let options = Options {
-        pbo: false,
-        pbo_reallocate_buffer: false,
-        client_storage: true,
-        texture_array: false,
-        texture_storage: false,
-        swizzle: false,
-        benchmark: true,
+    let options = if std::env::args().len() > 1 {
+        parse_options()
+    } else {
+        Options {
+            pbo: false,
+            pbo_count: 1,
+            pbo_reallocate_buffer: false,
+            client_storage: true,
+            texture_array: false,
+            texture_storage: false,
+            texture_rectangle: true,
+            apple_format: true,
+            swizzle: false,
+            benchmark: false,
+        }
     };
-    let pbo_count = 2;
 
-    let texture_rectangle = false;
-    let apple_format = true; // on Intel it looks like we don't need this particular format
+    validate_options(&options);
+    println!("{:#?}", options);
 
-    let texture_target = if texture_rectangle {
+    const BENCHMARK_FRAMES: usize = 1000;
+
+    let texture_target = if options.texture_rectangle {
         gl::TEXTURE_RECTANGLE_ARB
     } else {
         gl::TEXTURE_2D
@@ -560,8 +612,14 @@ fn main() {
     //let texture_internal_format = gl::RGBA32F;
     let texture_internal_format = gl::RGBA8;
 
-    let mut texture_src_format = if apple_format { gl::BGRA } else { gl::RGBA };
-    let mut texture_src_type = if apple_format {
+    // on Intel it looks like we don't need this particular format
+    let mut texture_src_format = if options.apple_format {
+        gl::BGRA
+    } else {
+        gl::RGBA
+    };
+
+    let mut texture_src_type = if options.apple_format {
         gl::UNSIGNED_INT_8_8_8_8_REV
     } else {
         gl::UNSIGNED_BYTE
@@ -589,7 +647,7 @@ fn main() {
         v_texture_coord = a_texture_coord;
     }";
 
-    let (sampler, coord) = if texture_rectangle {
+    let (sampler, coord) = if options.texture_rectangle {
         ("sampler2DRect", "v_texture_coord")
     } else if options.texture_array {
         ("sampler2DArray", "vec3(v_texture_coord, 0.0)")
@@ -626,7 +684,7 @@ fn main() {
     let u_sampler = gl.get_uniform_location(shader_program, "u_sampler");
 
     let mut image = load_image(texture_src_type);
-    let buffers = init_buffers(&gl, texture_rectangle, image.width, image.height);
+    let buffers = init_buffers(&gl, options.texture_rectangle, image.width, image.height);
 
     let texture = load_texture(
         &gl,
@@ -647,7 +705,9 @@ fn main() {
     let mut frame = 0;
 
     let size = (image.width * image.height * bpp(texture_src_type)) as usize;
+
     let mut pbos = Vec::new();
+    let pbo_count = options.pbo_count;
     pbos.resize_with(pbo_count, || PBO::new(&gl, size));
     let mut pbo_index = 0;
 
@@ -672,7 +732,7 @@ fn main() {
 
         if options.benchmark {
             frame += 1;
-            if frame > 200 {
+            if frame > BENCHMARK_FRAMES {
                 *control_flow = ControlFlow::Exit;
             }
         }
@@ -689,12 +749,13 @@ fn main() {
         gl.bind_texture(texture_target, texture.id);
 
         {
-            let read_index = pbo_index;
-            pbo_index = (pbo_index + 1) % pbo_count;
-            let write_index = pbo_index;
-
             let level = 0;
             if options.pbo {
+                assert!(pbo_count > 1);
+                let read_index = pbo_index;
+                pbo_index = (pbo_index + 1) % pbo_count;
+                let write_index = pbo_index;
+
                 let read_pbo = &mut pbos[read_index];
                 gl.bind_buffer(gl::PIXEL_UNPACK_BUFFER, read_pbo.id);
 
