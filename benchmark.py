@@ -20,9 +20,9 @@ texture_types = [
 upload_methods = [
     "--pbo 1",
     "--pbo 1 --pbo-reallocate-buffer",
+    "--pbo 1 --pbo-no-copy",
     "--pbo 2",
     "--pbo 2 --pbo-reallocate-buffer",
-    "--pbo 1 --pbo-no-copy",
     "--pbo 2 --pbo-no-copy",
     "--client-storage"
 ]

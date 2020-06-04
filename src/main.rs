@@ -17,7 +17,7 @@ use clap::App;
 
 use std::ptr;
 use std::rc::Rc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /* It was already known that the efficiency gains from client storage only materialize if you
   follow certain restrictions:
@@ -507,7 +507,6 @@ fn allow_gpu_switching() {
 }
 
 struct PBO {
-    fence: Option<GLsync>,
     id: GLuint,
     size: usize,
 }
@@ -525,11 +524,7 @@ impl PBO {
         );
         gl.bind_buffer(gl::PIXEL_UNPACK_BUFFER, 0);
 
-        PBO {
-            fence: None,
-            id: id,
-            size: size,
-        }
+        PBO { id: id, size: size }
     }
 
     fn reallocate_buffer(&mut self, gl: &Rc<dyn Gl>, image: &Image) {
@@ -546,7 +541,7 @@ impl PBO {
             gl::PIXEL_UNPACK_BUFFER,
             0,
             self.size as _,
-            gl::MAP_WRITE_BIT | gl::MAP_UNSYNCHRONIZED_BIT | gl::MAP_INVALIDATE_BUFFER_BIT,
+            gl::MAP_WRITE_BIT | gl::MAP_INVALIDATE_BUFFER_BIT,
         );
 
         if buffer != ptr::null_mut() {
@@ -560,9 +555,7 @@ impl PBO {
                     }
                 }
                 (None, Some(color)) => {
-                    let mut slice = unsafe {
-                        std::slice::from_raw_parts_mut(buffer, self.size)
-                    };
+                    let mut slice = unsafe { std::slice::from_raw_parts_mut(buffer, self.size) };
 
                     rotate_color(&mut slice, color);
                 }
@@ -571,16 +564,6 @@ impl PBO {
         }
 
         gl.unmap_buffer(gl::PIXEL_UNPACK_BUFFER);
-
-        let fence = gl.fence_sync(gl::SYNC_GPU_COMMANDS_COMPLETE, 0);
-        self.fence = Some(fence);
-    }
-
-    fn wait(&mut self, gl: &Rc<dyn Gl>) {
-        if let Some(fence) = self.fence.take() {
-            gl.client_wait_sync(fence, 0, 1_000_000_000);
-            gl.delete_sync(fence);
-        }
     }
 }
 
@@ -733,9 +716,6 @@ fn main() {
     let mut cube_rotation: f32 = 0.;
     let mut cube_color: u8 = 0;
 
-    let now = Instant::now();
-    let mut frame = 0;
-
     let size = (image.width * image.height * bpp(texture_src_type)) as usize;
 
     let mut pbos = Vec::new();
@@ -745,12 +725,19 @@ fn main() {
 
     let mut client_storage_fence: Option<GLsync> = None;
 
+    let now = Instant::now();
+    let mut elapsed: Option<Duration> = None;
+    let mut frame = 0;
+
     events_loop.run(move |event, _, control_flow| {
         match event {
             Event::LoopDestroyed => {
-                if options.benchmark {
-                    let elapsed = now.elapsed();
-                    println!("Rendering {} frames took {:?}", BENCHMARK_FRAMES, elapsed);
+                if let Some(elapsed) = elapsed {
+                    println!(
+                        "{} frames in {:.2} seconds",
+                        BENCHMARK_FRAMES,
+                        elapsed.as_secs_f64()
+                    );
                 }
                 return;
             }
@@ -765,6 +752,7 @@ fn main() {
         if options.benchmark {
             frame += 1;
             if frame > BENCHMARK_FRAMES {
+                elapsed = Some(now.elapsed());
                 *control_flow = ControlFlow::Exit;
             }
         }
@@ -792,8 +780,6 @@ fn main() {
 
                 let read_pbo = &mut pbos[read_index];
                 gl.bind_buffer(gl::PIXEL_UNPACK_BUFFER, read_pbo.id);
-
-                read_pbo.wait(&gl);
 
                 if options.texture_array {
                     gl.tex_sub_image_3d_pbo(
