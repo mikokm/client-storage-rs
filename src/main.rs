@@ -310,7 +310,7 @@ fn make_yellow(buf: &mut [u8]) {
 
 fn rotate_color(buf: &mut [u8], color: u8) {
     assert!(buf.len() % 32 == 0);
-    for i in (0..buf.len() - 1).step_by(4) {
+    for i in (0..buf.len()).step_by(64) {
         buf[i + 0] = color;
         buf[i + 1] = 0x00;
         buf[i + 2] = 0x00;
@@ -346,7 +346,7 @@ fn bpp(format: GLuint) -> i32 {
 fn load_image(format: GLuint) -> Image {
     if true {
         // stride needs to be 32-byte aligned to go fast with client storage
-        let width: i32 = 2048;
+        let width: i32 = 4096;
         let height: i32 = 2048;
         return Image {
             data: vec![0; (width * height * bpp(format)) as usize],
@@ -576,7 +576,7 @@ fn main() {
         .with_inner_size(glutin::dpi::LogicalSize::new(1920.0, 1080.0));
 
     let gl_window = glutin::ContextBuilder::new()
-        .with_vsync(true)
+        .with_vsync(false)
         .with_gl(glutin::GlRequest::GlThenGles {
             opengl_version: (3, 2),
             opengles_version: (3, 0),
@@ -723,7 +723,7 @@ fn main() {
     pbos.resize_with(pbo_count, || PBO::new(&gl, size));
     let mut pbo_index = 0;
 
-    let mut client_storage_fence: Option<GLsync> = None;
+    let mut read_fence: Option<GLsync> = None;
 
     let now = Instant::now();
     let mut elapsed: Option<Duration> = None;
@@ -757,7 +757,7 @@ fn main() {
             }
         }
 
-        if let Some(fence) = client_storage_fence.take() {
+        if let Some(fence) = read_fence.take() {
             gl.client_wait_sync(fence, 0, 1_000_000_000);
             gl.delete_sync(fence);
         }
@@ -857,8 +857,8 @@ fn main() {
                     );
                 }
 
-                if options.client_storage {
-                    client_storage_fence = Some(gl.fence_sync(gl::SYNC_GPU_COMMANDS_COMPLETE, 0));
+                if options.client_storage || options.pbo {
+                    read_fence = Some(gl.fence_sync(gl::SYNC_GPU_COMMANDS_COMPLETE, 0));
                 }
 
                 // sub image uploads are still fast as long as the memory is in the same place
