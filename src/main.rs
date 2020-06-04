@@ -578,7 +578,7 @@ fn main() {
     let options = if std::env::args().len() > 1 {
         parse_options()
     } else {
-        Options {
+        let options = Options {
             pbo: false,
             pbo_count: 1,
             pbo_reallocate_buffer: false,
@@ -589,13 +589,15 @@ fn main() {
             apple_format: true,
             swizzle: false,
             benchmark: false,
-        }
+        };
+
+        println!("Using options: {:?}", options);
+        options
     };
 
     validate_options(&options);
-    println!("{:#?}", options);
 
-    const BENCHMARK_FRAMES: usize = 1000;
+    const BENCHMARK_FRAMES: usize = 300;
 
     let texture_target = if options.texture_rectangle {
         gl::TEXTURE_RECTANGLE_ARB
@@ -718,7 +720,7 @@ fn main() {
             Event::LoopDestroyed => {
                 if options.benchmark {
                     let elapsed = now.elapsed();
-                    println!("{:?}", elapsed);
+                    println!("Rendering {} frames took {:?}", BENCHMARK_FRAMES, elapsed);
                 }
                 return;
             }
@@ -751,7 +753,7 @@ fn main() {
         {
             let level = 0;
             if options.pbo {
-                assert!(pbo_count > 1);
+                assert!(pbo_count >= 1);
                 let read_index = pbo_index;
                 pbo_index = (pbo_index + 1) % pbo_count;
                 let write_index = pbo_index;
